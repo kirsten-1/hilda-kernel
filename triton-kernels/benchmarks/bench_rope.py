@@ -129,22 +129,40 @@ def backward_test():
     bsz, seq_len, n_qh, n_kh, hd = 2, 256, 32, 8, 128
     q, k, cos, sin = make_inputs(bsz, seq_len, n_qh, n_kh, hd, dtype, device)
 
-    # PyTorch backward
+    # ── 1. 直接测试 rope_backward kernel（无 autograd）────────────────────────
+    from kernels.rope import rope_backward
+    dq_in = torch.ones(bsz, n_qh, seq_len, hd, device=device, dtype=dtype)
+    dk_in = torch.ones(bsz, n_kh, seq_len, hd, device=device, dtype=dtype)
+    dq_out_direct, dk_out_direct = rope_backward(dq_in, dk_in, cos, sin)
+
+    # 期望: dq_out[..., :hd//2] = cos+sin,  dq_out[..., hd//2:] = cos-sin
+    c = cos.unsqueeze(1)  # (1,1,seq,hd//2) broadcast over bsz,heads
+    s = sin.unsqueeze(1)
+    exp_dq = torch.cat([c + s, c - s], dim=-1).expand_as(dq_in)
+    exp_dk = torch.cat([c + s, c - s], dim=-1).expand_as(dk_in)
+    d_dq = (dq_out_direct - exp_dq).abs().max().item()
+    d_dk = (dk_out_direct - exp_dk).abs().max().item()
+    ok_kernel = d_dq < 1e-4 and d_dk < 1e-4
+    print(f"  rope_backward kernel direct: dq={d_dq:.2e}, dk={d_dk:.2e} [{'PASS' if ok_kernel else 'FAIL'}]")
+
+    # ── 2. Autograd 路径测试 ─────────────────────────────────────────────────
     q_ref = q.clone().requires_grad_(True)
     k_ref = k.clone().requires_grad_(True)
     q_out, k_out = pytorch_rope(q_ref, k_ref, cos, sin)
     (q_out.sum() + k_out.sum()).backward()
 
-    # Ours backward
     q_ours = q.clone().requires_grad_(True)
     k_ours = k.clone().requires_grad_(True)
     q_o, k_o = hilda_rope(q_ours, k_ours, cos, sin)
     (q_o.sum() + k_o.sum()).backward()
 
+    print(f"  q_ours.grad is None: {q_ours.grad is None}")
+    print(f"  k_ours.grad is None: {k_ours.grad is None}")
+
     dq_diff = (q_ours.grad - q_ref.grad).abs().max().item()
     dk_diff = (k_ours.grad - k_ref.grad).abs().max().item()
     status = "PASS" if dq_diff < 1e-4 and dk_diff < 1e-4 else "FAIL"
-    print(f"  backward: dq_diff={dq_diff:.2e}, dk_diff={dk_diff:.2e} [{status}]")
+    print(f"  autograd backward: dq_diff={dq_diff:.2e}, dk_diff={dk_diff:.2e} [{status}]")
     print()
 
 
@@ -191,7 +209,9 @@ def bench_fwd_bwd(bsz, seq_len, n_qh, n_kh, hd, dtype, device='cuda'):
         cos = torch.randn(1, seq_len, hd // 2, device=device, dtype=dtype)
         sin = torch.randn(1, seq_len, hd // 2, device=device, dtype=dtype)
         q_o, k_o = pytorch_rope(q, k, cos, sin)
-        (q_o.sum() + k_o.sum()).backward()
+        # Use explicit ones gradient to avoid zero-stride broadcast artifact from sum().backward()
+        torch.autograd.backward([q_o, k_o],
+                                [torch.ones_like(q_o), torch.ones_like(k_o)])
     results['pytorch'] = benchmark_fn(pt_fn, warmup=5, rep=50)
 
     # Ours
@@ -201,7 +221,8 @@ def bench_fwd_bwd(bsz, seq_len, n_qh, n_kh, hd, dtype, device='cuda'):
         cos = torch.randn(1, seq_len, hd // 2, device=device, dtype=dtype)
         sin = torch.randn(1, seq_len, hd // 2, device=device, dtype=dtype)
         q_o, k_o = hilda_rope(q, k, cos, sin)
-        (q_o.sum() + k_o.sum()).backward()
+        torch.autograd.backward([q_o, k_o],
+                                [torch.ones_like(q_o), torch.ones_like(k_o)])
     results['ours_autotune'] = benchmark_fn(ours_fn, warmup=5, rep=50)
 
     # Liger
@@ -212,7 +233,8 @@ def bench_fwd_bwd(bsz, seq_len, n_qh, n_kh, hd, dtype, device='cuda'):
             cos = torch.randn(1, seq_len, hd // 2, device=device, dtype=dtype)
             sin = torch.randn(1, seq_len, hd // 2, device=device, dtype=dtype)
             q_o, k_o = LigerRopeFunction.apply(q, k, cos, sin)
-            (q_o.sum() + k_o.sum()).backward()
+            torch.autograd.backward([q_o, k_o],
+                                    [torch.ones_like(q_o), torch.ones_like(k_o)])
         try:
             results['liger'] = benchmark_fn(liger_fn, warmup=5, rep=50)
         except Exception as e:

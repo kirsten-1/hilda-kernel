@@ -1,12 +1,19 @@
 """
-RoPE (Rotary Position Embedding) with AutoTune
+RoPE (Rotary Position Embedding) - Per-Head Kernel
 
-Implements the HuggingFace Llama/Mistral variant of RoPE.
+核心优化：直接操作原始 (bsz, n_head, seq_len, hd) layout，
+彻底消除 Liger 中的 transpose + contiguous 拷贝开销。
 
-Improvements over Liger-Kernel:
-1. AutoTune num_warps / num_stages - Liger 硬编码 num_warps=4
-2. 分离 forward/backward kernel - 比 constexpr 分支更清晰，各自独立调优
-3. 保持 in-place 执行 + Q/K coarsening（同一 kernel 处理 Q 和 K，节省 launch overhead）
+RoPE 的关键性质：
+  backward = forward with -sin（旋转矩阵的逆 = 转置 = 旋转角取反）
+  dx1 = dy1*cos + dy2*sin = forward(dy, cos, -sin) 第一半
+  dx2 = dy2*cos - dy1*sin = forward(dy, cos, -sin) 第二半
+
+所以 forward/backward 共用同一个 kernel，backward 只需传 -sin。
+
+内存流量对比（LLaMA-3 8B GQA, bsz=4, seq=2048）：
+  Liger:  83MB(contiguous copy) + 83MB(read) + 83MB(write) = 249MB per pass
+  Ours:   83MB(read) + 83MB(write)                         = 166MB per pass  ← 节省 33%
 """
 
 import torch
@@ -15,194 +22,88 @@ import triton.language as tl
 
 
 # ============================================================================
-# AutoTune 配置
-# ============================================================================
-
-def get_rope_configs():
-    """
-    RoPE 的 AutoTune 配置
-
-    注意：RoPE 的 tile 形状由模型架构决定（n_qh, n_kh, hd），
-    不适合搜索 BLOCK_SIZE。只搜索 num_warps 和 num_stages。
-    """
-    configs = []
-    for num_warps in [2, 4, 8, 16, 32]:
-        for num_stages in [1, 2, 3]:
-            configs.append(triton.Config({}, num_warps=num_warps, num_stages=num_stages))
-    return configs
-
-
-def get_rope_num_warps(n_qh, n_kh, hd):
-    """
-    启发式选择 num_warps
-
-    RoPE 是 in-place kernel，不能用 AutoTune（AutoTune 多次调用 kernel
-    会反复旋转同一份数据，导致结果错误）。
-    根据 tile 大小选择合理的 num_warps。
-    """
-    total_elements = (n_qh + n_kh) * hd
-    if total_elements <= 1024:
-        return 4
-    elif total_elements <= 4096:
-        return 8
-    elif total_elements <= 16384:
-        return 16
-    else:
-        return 32
-
-
-# ============================================================================
-# Forward Kernel
+# Per-Head Kernel（forward 和 backward 共用，backward 传 neg_sin）
 # ============================================================================
 
 @triton.jit
-def _rope_forward_kernel(
-    q_ptr, q_row_stride,
-    k_ptr, k_row_stride,
-    cos_ptr, cos_row_stride,
-    sin_ptr, sin_row_stride,
-    sl,
-    cos_bs: tl.constexpr,  # 1 或 bsz：cos/sin 是否 batch 维广播
-    n_qh: tl.constexpr,
-    n_kh: tl.constexpr,
-    hd: tl.constexpr,
-    pad_n_qh: tl.constexpr,
-    pad_n_kh: tl.constexpr,
-    pad_hd: tl.constexpr,
-):
-    """
-    RoPE Forward Kernel
-
-    数学：
-      y1 = x1 * cos - x2 * sin
-      y2 = x2 * cos + x1 * sin
-    其中 x1 = x[..., :hd//2], x2 = x[..., hd//2:]
-
-    优化：
-    1. In-place：直接写回原始 q/k 内存
-    2. Q/K coarsening：一个 program 同时处理 Q 和 K 的一个 (batch, seq) 位置
-    3. constexpr shape：所有 tile 维度在编译时确定，无运行时边界判断开销
-    """
-    pid = tl.program_id(0).to(tl.int64)
-
-    # 各 program 负责 q/k 中的一个 (batch, seq) 位置
-    q_ptr = q_ptr + pid * q_row_stride
-    k_ptr = k_ptr + pid * k_row_stride
-
-    # 定位 cos/sin 行
-    batch_idx = pid // sl
-    seq_idx   = pid % sl
-    cos_offset = tl.where(
-        cos_bs == 1,
-        seq_idx * cos_row_stride,
-        batch_idx * sl * cos_row_stride + seq_idx * cos_row_stride,
-    )
-    cos_ptr = cos_ptr + cos_offset
-    sin_ptr = sin_ptr + cos_offset
-
-    # 加载 cos/sin（只需要左半部分 hd//2）
-    cs_idx = tl.arange(0, pad_hd // 2)
-    cs_mask = cs_idx < hd // 2
-    cos_row = tl.load(cos_ptr + cs_idx, mask=cs_mask, other=0.0)
-    sin_row = tl.load(sin_ptr + cs_idx, mask=cs_mask, other=0.0)
-
-    # ---- Process Q ----
-    # Tile shape: [pad_n_qh, hd//2]，同时加载左右两半
-    qh_idx = tl.arange(0, pad_n_qh)
-    q_mask = (qh_idx[:, None] < n_qh) & (cs_idx[None, :] < hd // 2)
-    q1_off = qh_idx[:, None] * hd + cs_idx[None, :]   # 左半部分
-    q2_off = q1_off + hd // 2                          # 右半部分
-
-    q1 = tl.load(q_ptr + q1_off, mask=q_mask, other=0.0).to(cos_row.dtype)
-    q2 = tl.load(q_ptr + q2_off, mask=q_mask, other=0.0).to(cos_row.dtype)
-
-    # In-place 写回
-    tl.store(q_ptr + q1_off, q1 * cos_row[None, :] - q2 * sin_row[None, :], mask=q_mask)
-    tl.store(q_ptr + q2_off, q2 * cos_row[None, :] + q1 * sin_row[None, :], mask=q_mask)
-
-    # ---- Process K ----
-    kh_idx = tl.arange(0, pad_n_kh)
-    k_mask = (kh_idx[:, None] < n_kh) & (cs_idx[None, :] < hd // 2)
-    k1_off = kh_idx[:, None] * hd + cs_idx[None, :]
-    k2_off = k1_off + hd // 2
-
-    k1 = tl.load(k_ptr + k1_off, mask=k_mask, other=0.0).to(cos_row.dtype)
-    k2 = tl.load(k_ptr + k2_off, mask=k_mask, other=0.0).to(cos_row.dtype)
-
-    tl.store(k_ptr + k1_off, k1 * cos_row[None, :] - k2 * sin_row[None, :], mask=k_mask)
-    tl.store(k_ptr + k2_off, k2 * cos_row[None, :] + k1 * sin_row[None, :], mask=k_mask)
-
-
-# ============================================================================
-# Backward Kernel
-# ============================================================================
-
-@triton.jit
-def _rope_backward_kernel(
-    dq_ptr, dq_row_stride,
-    dk_ptr, dk_row_stride,
-    cos_ptr, cos_row_stride,
-    sin_ptr, sin_row_stride,
-    sl,
+def _rope_fwd_kernel(
+    x_in_ptr,      # input  (bsz, n_heads, seq_len, hd)
+    x_out_ptr,     # output (same shape; may equal x_in_ptr for in-place)
+    x_bs_stride,   # stride(0)
+    x_h_stride,    # stride(1)
+    x_s_stride,    # stride(2)
+    cos_ptr,
+    cos_bs_stride,
+    cos_s_stride,
+    sin_ptr,       # pass -sin for backward pass
+    n_heads,
+    seq_len,
     cos_bs: tl.constexpr,
-    n_qh: tl.constexpr,
-    n_kh: tl.constexpr,
     hd: tl.constexpr,
-    pad_n_qh: tl.constexpr,
-    pad_n_kh: tl.constexpr,
     pad_hd: tl.constexpr,
 ):
     """
-    RoPE Backward Kernel
+    Forward:  y1 = x1*cos - x2*sin,   y2 = x2*cos + x1*sin
+    Backward: dx1 = dy1*cos + dy2*sin, dx2 = dy2*cos - dy1*sin
+              ← same formula with sin replaced by -sin
 
-    Forward: y1 = x1*cos - x2*sin, y2 = x2*cos + x1*sin
-    Backward（对 x 求梯度）:
-      dx1 = dy1*cos + dy2*sin
-      dx2 = dy2*cos - dy1*sin
-    即用 -sin 做一次 forward RoPE。
+    每个 program 处理一个 (batch, head, seq_pos) 的 hd 个元素。
+    x[b, h, s, :] 在内存中连续（stride(3)=1），coalesced access。
     """
     pid = tl.program_id(0).to(tl.int64)
-    dq_ptr = dq_ptr + pid * dq_row_stride
-    dk_ptr = dk_ptr + pid * dk_row_stride
 
-    batch_idx = pid // sl
-    seq_idx   = pid % sl
+    b   = pid // (n_heads * seq_len)
+    rem = pid %  (n_heads * seq_len)
+    h   = rem // seq_len
+    s   = rem %  seq_len
+
+    row_off   = b * x_bs_stride + h * x_h_stride + s * x_s_stride
+    x_in_row  = x_in_ptr  + row_off
+    x_out_row = x_out_ptr + row_off
+
     cos_offset = tl.where(
         cos_bs == 1,
-        seq_idx * cos_row_stride,
-        batch_idx * sl * cos_row_stride + seq_idx * cos_row_stride,
+        s * cos_s_stride,
+        b * cos_bs_stride + s * cos_s_stride,
     )
-    cos_ptr = cos_ptr + cos_offset
-    sin_ptr = sin_ptr + cos_offset
 
-    cs_idx = tl.arange(0, pad_hd // 2)
+    cs_idx  = tl.arange(0, pad_hd // 2)
     cs_mask = cs_idx < hd // 2
-    cos_row = tl.load(cos_ptr + cs_idx, mask=cs_mask, other=0.0)
-    sin_row = tl.load(sin_ptr + cs_idx, mask=cs_mask, other=0.0)
 
-    # ---- dQ ----
-    qh_idx = tl.arange(0, pad_n_qh)
-    q_mask = (qh_idx[:, None] < n_qh) & (cs_idx[None, :] < hd // 2)
-    q1_off = qh_idx[:, None] * hd + cs_idx[None, :]
-    q2_off = q1_off + hd // 2
+    cos_row = tl.load(cos_ptr + cos_offset + cs_idx, mask=cs_mask, other=0.0)
+    sin_row = tl.load(sin_ptr + cos_offset + cs_idx, mask=cs_mask, other=0.0)
 
-    dq1 = tl.load(dq_ptr + q1_off, mask=q_mask, other=0.0).to(cos_row.dtype)
-    dq2 = tl.load(dq_ptr + q2_off, mask=q_mask, other=0.0).to(cos_row.dtype)
+    x1 = tl.load(x_in_row + cs_idx,           mask=cs_mask, other=0.0).to(cos_row.dtype)
+    x2 = tl.load(x_in_row + hd // 2 + cs_idx, mask=cs_mask, other=0.0).to(cos_row.dtype)
 
-    tl.store(dq_ptr + q1_off, dq1 * cos_row[None, :] + dq2 * sin_row[None, :], mask=q_mask)
-    tl.store(dq_ptr + q2_off, dq2 * cos_row[None, :] - dq1 * sin_row[None, :], mask=q_mask)
+    y1 = x1 * cos_row - x2 * sin_row
+    y2 = x2 * cos_row + x1 * sin_row
 
-    # ---- dK ----
-    kh_idx = tl.arange(0, pad_n_kh)
-    k_mask = (kh_idx[:, None] < n_kh) & (cs_idx[None, :] < hd // 2)
-    k1_off = kh_idx[:, None] * hd + cs_idx[None, :]
-    k2_off = k1_off + hd // 2
+    tl.store(x_out_row + cs_idx,           y1, mask=cs_mask)
+    tl.store(x_out_row + hd // 2 + cs_idx, y2, mask=cs_mask)
 
-    dk1 = tl.load(dk_ptr + k1_off, mask=k_mask, other=0.0).to(cos_row.dtype)
-    dk2 = tl.load(dk_ptr + k2_off, mask=k_mask, other=0.0).to(cos_row.dtype)
 
-    tl.store(dk_ptr + k1_off, dk1 * cos_row[None, :] + dk2 * sin_row[None, :], mask=k_mask)
-    tl.store(dk_ptr + k2_off, dk2 * cos_row[None, :] - dk1 * sin_row[None, :], mask=k_mask)
+# ============================================================================
+# 工具函数
+# ============================================================================
+
+def _rope_num_warps(hd: int) -> int:
+    half = triton.next_power_of_2(hd // 2)
+    return max(1, min(half // 32, 32))
+
+
+def _launch(x_in, x_out, cos, sin, n_heads, nw):
+    """Launch rope kernel for one tensor (Q or K)."""
+    bsz, _, seq_len, hd = x_in.shape
+    pad_hd = triton.next_power_of_2(hd)
+    cos_bs = cos.shape[0]
+    _rope_fwd_kernel[(bsz * n_heads * seq_len,)](
+        x_in, x_out,
+        x_in.stride(0), x_in.stride(1), x_in.stride(2),
+        cos, cos.stride(0), cos.stride(1), sin,
+        n_heads, seq_len, cos_bs, hd, pad_hd,
+        num_warps=nw,
+    )
 
 
 # ============================================================================
@@ -211,52 +112,36 @@ def _rope_backward_kernel(
 
 def rope_forward(q, k, cos, sin):
     """
-    RoPE Forward
+    RoPE Forward（分配新输出张量，避免 autograd leaf 原地修改问题）
 
     Args:
-        q:   (bsz, n_qh, seq_len, hd) - HuggingFace 格式
+        q:   (bsz, n_qh, seq_len, hd)
         k:   (bsz, n_kh, seq_len, hd)
-        cos: (1, seq_len, hd//2) 或 (bsz, seq_len, hd//2)
+        cos: (1, seq_len, hd//2) or (bsz, seq_len, hd//2)
         sin: same shape as cos
 
     Returns:
-        q, k (in-place modified), cos, sin
+        q_out, k_out (new tensors), cos, sin
     """
-    # 转置到 (bsz, seq_len, n_h, hd)，使行步长 = n_h * hd（物理连续）
-    q = q.transpose(1, 2)
-    k = k.transpose(1, 2)
+    bsz, n_qh, seq_len, hd = q.shape
+    n_kh = k.shape[1]
+    nw   = _rope_num_warps(hd)
 
-    bsz, seq_len, n_qh, hd = q.shape
-    n_kh = k.shape[2]
-    pad_n_qh = triton.next_power_of_2(n_qh)
-    pad_n_kh = triton.next_power_of_2(n_kh)
-    pad_hd   = triton.next_power_of_2(hd)
+    q_out = torch.empty_like(q)
+    k_out = torch.empty_like(k)
 
-    q   = q.contiguous()
-    k   = k.contiguous()
-    cos = cos.contiguous()
-    sin = sin.contiguous()
+    _launch(q, q_out, cos, sin, n_qh, nw)
+    _launch(k, k_out, cos, sin, n_kh, nw)
 
-    cos_bs = cos.shape[0]
-    num_warps = get_rope_num_warps(n_qh, n_kh, hd)
-
-    _rope_forward_kernel[(bsz * seq_len,)](
-        q, q.stride(1),
-        k, k.stride(1),
-        cos, cos.stride(-2),
-        sin, sin.stride(-2),
-        seq_len, cos_bs,
-        n_qh, n_kh, hd,
-        pad_n_qh, pad_n_kh, pad_hd,
-        num_warps=num_warps,
-    )
-
-    return q.transpose(1, 2), k.transpose(1, 2), cos, sin
+    return q_out, k_out, cos, sin
 
 
 def rope_backward(dq, dk, cos, sin):
     """
-    RoPE Backward
+    RoPE Backward（共用 forward kernel，传 -sin 实现转置旋转）
+
+    原理：RoPE 是正交变换，其逆等于转置，等价于旋转角取反（即 sin 取反）。
+    dx = R(-θ) * dy = forward(dy, cos, -sin)
 
     Args:
         dq: (bsz, n_qh, seq_len, hd)
@@ -264,35 +149,27 @@ def rope_backward(dq, dk, cos, sin):
         cos, sin: 与 forward 相同
 
     Returns:
-        dq, dk (in-place modified)
+        dq_out, dk_out (new tensors)
     """
-    dq = dq.transpose(1, 2)
-    dk = dk.transpose(1, 2)
+    # PyTorch may pass zero-stride broadcast tensors for gradient of sum()
+    # Triton requires contiguous memory; materialize before kernel launch.
+    if not dq.is_contiguous():
+        dq = dq.contiguous()
+    if not dk.is_contiguous():
+        dk = dk.contiguous()
 
-    bsz, seq_len, n_qh, hd = dq.shape
-    n_kh = dk.shape[2]
-    pad_n_qh = triton.next_power_of_2(n_qh)
-    pad_n_kh = triton.next_power_of_2(n_kh)
-    pad_hd   = triton.next_power_of_2(hd)
+    bsz, n_qh, seq_len, hd = dq.shape
+    n_kh    = dk.shape[1]
+    nw      = _rope_num_warps(hd)
+    neg_sin = -sin  # 取反 sin 实现 backward（= R^T = R(-θ)）
 
-    dq = dq.contiguous()
-    dk = dk.contiguous()
+    dq_out = torch.empty_like(dq)
+    dk_out = torch.empty_like(dk)
 
-    cos_bs = cos.shape[0]
-    num_warps = get_rope_num_warps(n_qh, n_kh, hd)
+    _launch(dq, dq_out, cos, neg_sin, n_qh, nw)
+    _launch(dk, dk_out, cos, neg_sin, n_kh, nw)
 
-    _rope_backward_kernel[(bsz * seq_len,)](
-        dq, dq.stride(1),
-        dk, dk.stride(1),
-        cos, cos.stride(-2),
-        sin, sin.stride(-2),
-        seq_len, cos_bs,
-        n_qh, n_kh, hd,
-        pad_n_qh, pad_n_kh, pad_hd,
-        num_warps=num_warps,
-    )
-
-    return dq.transpose(1, 2), dk.transpose(1, 2)
+    return dq_out, dk_out
 
 
 # ============================================================================
@@ -301,7 +178,7 @@ def rope_backward(dq, dk, cos, sin):
 
 class HildaRopeFunction(torch.autograd.Function):
     """
-    RoPE with AutoTune
+    RoPE with per-head kernel（无 transpose+contiguous 开销）
 
     Interface 与 Liger 兼容：
         q, k = HildaRopeFunction.apply(q, k, cos, sin)
@@ -309,21 +186,15 @@ class HildaRopeFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, cos, sin):
-        """
-        q: (bsz, n_qh, seq_len, hd)
-        k: (bsz, n_kh, seq_len, hd)
-        cos: (1, seq_len, hd//2) or (bsz, seq_len, hd//2)
-        sin: same as cos
-        """
-        q, k, cos, sin = rope_forward(q, k, cos, sin)
+        q_out, k_out, cos, sin = rope_forward(q, k, cos, sin)
         ctx.save_for_backward(cos, sin)
-        return q, k
+        return q_out, k_out
 
     @staticmethod
     def backward(ctx, dq, dk):
         cos, sin = ctx.saved_tensors
-        dq, dk = rope_backward(dq, dk, cos, sin)
-        return dq, dk, None, None
+        dq_out, dk_out = rope_backward(dq, dk, cos, sin)
+        return dq_out, dk_out, None, None
 
 
 def hilda_rope(q, k, cos, sin):
@@ -332,19 +203,10 @@ def hilda_rope(q, k, cos, sin):
 
 
 # ============================================================================
-# nn.Module（用于直接替换 HuggingFace 模型中的 RoPE）
+# nn.Module
 # ============================================================================
 
 class RotaryEmbedding(torch.nn.Module):
-    """
-    Drop-in replacement for HuggingFace LlamaRotaryEmbedding
-
-    用法：
-        rope = RotaryEmbedding(head_dim, max_seq_len)
-        cos, sin = rope(x, seq_len)
-        q, k = rope.apply(q, k, cos, sin)
-    """
-
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
         self.dim = dim
@@ -353,10 +215,10 @@ class RotaryEmbedding(torch.nn.Module):
         self._set_cos_sin_cache(max_position_embeddings, device)
 
     def _set_cos_sin_cache(self, seq_len, device):
-        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        t     = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
         freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos()[None, :, :self.dim // 2])  # (1, seq, dim//2)
+        emb   = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos()[None, :, :self.dim // 2])
         self.register_buffer("sin_cached", emb.sin()[None, :, :self.dim // 2])
 
     def forward(self, x, seq_len=None):
