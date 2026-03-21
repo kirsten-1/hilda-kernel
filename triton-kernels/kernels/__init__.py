@@ -24,4 +24,6 @@ __all__ = [
     "HildaJSDFunction", "hilda_jsd", "JSDLoss",
     "HildaFusedLinearJSDFunction", "hilda_fused_linear_jsd", "FusedLinearJSDLoss",
     "HildaGRPOLossFunction", "hilda_grpo_loss", "GRPOLoss", "fused_selective_log_softmax",
+    "hilda_paged_attention_fp8_decode", "reference_paged_attention_decode",
 ]
+from .paged_attention_fp8 import hilda_paged_attention_fp8_decode, reference_paged_attention_decode
